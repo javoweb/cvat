@@ -62,56 +62,89 @@ def run_tensorflow_annotation(frame_provider, labels_mapping, threshold, model_p
         raise OSError('Model path env not found in the system.')
     job = rq.get_current_job()
     #add .pb if default model selected
-    if "inference" in model_path  and not model_path.endswith('pb'):
-        model_path += ".pb"
-    detection_graph = tf.Graph()
-    with detection_graph.as_default():
-        od_graph_def = tf.GraphDef()
-        with tf.gfile.GFile(model_path , 'rb') as fid:
-            serialized_graph = fid.read()
-            od_graph_def.ParseFromString(serialized_graph)
-            tf.import_graph_def(od_graph_def, name='')
+    if "inference" in model_path:
+        if not model_path.endswith('pb'):
+            model_path += ".pb"
+        detection_graph = tf.Graph()
+        with detection_graph.as_default():
+            od_graph_def = tf.GraphDef()
+            with tf.gfile.GFile(model_path , 'rb') as fid:
+                serialized_graph = fid.read()
+                od_graph_def.ParseFromString(serialized_graph)
+                tf.import_graph_def(od_graph_def, name='')
 
-        try:
-            config = tf.ConfigProto()
-            config.gpu_options.allow_growth=True
-            sess = tf.Session(graph=detection_graph, config=config)
-            frames = frame_provider.get_frames(frame_provider.Quality.ORIGINAL)
-            for image_num, (image, _) in enumerate(frames):
+            try:
+                config = tf.ConfigProto()
+                config.gpu_options.allow_growth=True
+                sess = tf.Session(graph=detection_graph, config=config)
+                frames = frame_provider.get_frames(frame_provider.Quality.ORIGINAL)
+                for image_num, (image, _) in enumerate(frames):
 
-                job.refresh()
-                if 'cancel' in job.meta:
-                    del job.meta['cancel']
-                    job.save()
-                    return None
-                job.meta['progress'] = image_num * 100 / len(frame_provider)
-                job.save_meta()
+                    job.refresh()
+                    if 'cancel' in job.meta:
+                        del job.meta['cancel']
+                        job.save()
+                        return None
+                    job.meta['progress'] = image_num * 100 / len(frame_provider)
+                    job.save_meta()
 
-                image = Image.open(image)
-                width, height = image.size
-                if width > 1920 or height > 1080:
-                    image = image.resize((width // 2, height // 2), Image.ANTIALIAS)
-                image_np = load_image_into_numpy(image)
-                image_np_expanded = np.expand_dims(image_np, axis=0)
+                    image = Image.open(image)
+                    width, height = image.size
+                    if width > 1920 or height > 1080:
+                        image = image.resize((width // 2, height // 2), Image.ANTIALIAS)
+                    image_np = load_image_into_numpy(image)
+                    image_np_expanded = np.expand_dims(image_np, axis=0)
 
-                image_tensor = detection_graph.get_tensor_by_name('image_tensor:0')
-                boxes = detection_graph.get_tensor_by_name('detection_boxes:0')
-                scores = detection_graph.get_tensor_by_name('detection_scores:0')
-                classes = detection_graph.get_tensor_by_name('detection_classes:0')
-                num_detections = detection_graph.get_tensor_by_name('num_detections:0')
-                (boxes, scores, classes, num_detections) = sess.run([boxes, scores, classes, num_detections], feed_dict={image_tensor: image_np_expanded})
+                    image_tensor = detection_graph.get_tensor_by_name('image_tensor:0')
+                    boxes = detection_graph.get_tensor_by_name('detection_boxes:0')
+                    scores = detection_graph.get_tensor_by_name('detection_scores:0')
+                    classes = detection_graph.get_tensor_by_name('detection_classes:0')
+                    num_detections = detection_graph.get_tensor_by_name('num_detections:0')
+                    (boxes, scores, classes, num_detections) = sess.run([boxes, scores, classes, num_detections], feed_dict={image_tensor: image_np_expanded})
 
-                for i in range(len(classes[0])):
-                    if classes[0][i] in labels_mapping.keys():
-                        if scores[0][i] >= threshold:
-                            xmin, ymin, xmax, ymax = _normalize_box(boxes[0][i], width, height)
-                            label = labels_mapping[classes[0][i]]
-                            if label not in result:
-                                result[label] = []
-                            result[label].append([image_num, xmin, ymin, xmax, ymax])
-        finally:
-            sess.close()
-            del sess
+                    for i in range(len(classes[0])):
+                        if classes[0][i] in labels_mapping.keys():
+                            if scores[0][i] >= threshold:
+                                xmin, ymin, xmax, ymax = _normalize_box(boxes[0][i], width, height)
+                                label = labels_mapping[classes[0][i]]
+                                if label not in result:
+                                    result[label] = []
+                                result[label].append([image_num, xmin, ymin, xmax, ymax])
+            finally:
+                sess.close()
+                del sess
+    elif "saved_model" in model_path:
+        imported_model_v2 = tf.saved_model.load_v2(model_path)
+        inference_function = imported_model_v2.signatures["serving_default"]
+        with tf.Session() as sess:
+            init = tf.global_variables_initializer()
+            sess.run(init)
+        frames = frame_provider.get_frames(frame_provider.Quality.ORIGINAL)
+        for image_num, (image, _) in enumerate(frames):
+            job.refresh()
+            if 'cancel' in job.meta:
+                del job.meta['cancel']
+                job.save()
+                return None
+            job.meta['progress'] = image_num * 100 / len(frame_provider)
+            job.save_meta()
+            img = tf.io.read_file(image)
+            img = tf.image.decode_jpeg(img, channels=3)
+            img_shape = tf.shape(img).numpy()
+            img = tf.expand_dims(img, axis=0, name='input_tensor')
+            inference_result = inference_function(img)
+            with tf.Session() as sess:
+                inference_result = sess.run(inference_result)
+            if(inference_result['num_detections'][0]>0):
+                index = 0
+                while (index<inference_result['num_detections'][0]) and inference_result['detection_scores'][0][index] >= threshold:
+                    if inference_result['detection_classes'][0][index] in labels_mapping.keys():
+                        xmin, ymin, xmax, ymax = _normalize_box(inference_result['detection_boxes'][index], img_shape[0], img_shape[1])
+                        label = labels_mapping[inference_result['detection_classes'][0][index]]
+                        if label not in result:
+                            result[label] = []
+                        result[label].append([image_num, xmin, ymin, xmax, ymax])
+                    index += 1
     return result
 
 def convert_to_cvat_format(data):
